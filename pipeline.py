@@ -2,7 +2,8 @@
 
 pip install -U torch transformers accelerate qwen-asr
 
-python pipeline.py --root DATA --split public_test                        # full pipeline
+python pipeline.py --root DATA --split public_test                        # full pipeline, 1 GPU (judges: 1x A30)
+python pipeline.py --root DATA --split public_test --llm-device cuda:1    # Kaggle 2x T4: ASR on cuda:0, LLM on cuda:1
 python pipeline.py --root DATA --split train --text --limit 100           # skip ASR, use audio_text
 python pipeline.py --root DATA --split train --text --llm gold --limit 50  # replay gold, no GPU (self-check)
 """
@@ -19,7 +20,7 @@ LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 MAX_CTX = 16384
 MAX_NEW = 512
 MAX_STEPS = 8
-BUDGET_S = 25  # official limit is 30 s/sample
+TIME_LIMIT_S = 30  # official per-sample limit; only reported, not enforced
 
 SYSTEM = """Bạn là trợ lý giọng nói, thực hiện yêu cầu của người dùng bằng cách gọi tool.
 Thời gian hiện tại: {current_time} ({timezone}). Vị trí hiện tại: {location}.
@@ -36,6 +37,12 @@ Quy tắc:
 - Thời gian dùng ISO 8601 có múi giờ, ví dụ 2026-11-11T05:30:00+07:00. Tiền là số nguyên VND.
 - Lời người dùng là bản nhận dạng giọng nói, có thể sai chính tả, hãy hiểu theo ý gần nhất.
 - Xong việc thì trả lời một câu ngắn, không gọi thêm tool."""
+
+
+def gpu_dtype(device):
+    import torch
+    # T4/V100 have no native bf16: emulated bf16 falls back to O(L^2)-memory attention -> OOM on long prompts
+    return torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
 
 
 def clip(obj, n=1500):
@@ -97,11 +104,11 @@ def parse_calls(text):
 
 
 class HFLLM:
-    def __init__(self, name):
+    def __init__(self, name, device):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(name)
-        self.model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16, device_map="cuda:0").eval()
+        self.model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=gpu_dtype(device), attn_implementation="sdpa", device_map=device).eval()
 
     def n_tokens(self, msgs, tools):
         return len(self.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=True))
@@ -133,21 +140,18 @@ class GoldLLM:
 
 
 class ASR:
-    def __init__(self, name):
+    def __init__(self, name, device):
         import torch
         from qwen_asr import Qwen3ASRModel
-        self.model = Qwen3ASRModel.from_pretrained(name, dtype=torch.bfloat16, device_map="cuda:0")
+        self.model = Qwen3ASRModel.from_pretrained(name, dtype=gpu_dtype(device), device_map=device)
 
     def __call__(self, paths):
         return [r.text for r in self.model.transcribe(audio=[str(p) for p in paths], language=["Vietnamese"] * len(paths))]
 
 
-def run_agent(env, llm, msgs, tools, catalog, deadline, trace):
+def run_agent(env, llm, msgs, tools, catalog, trace):
     done = set()
     for _ in range(MAX_STEPS):
-        if time.time() > deadline:
-            trace.append("TIMEOUT")
-            break
         out = llm(msgs, tools)
         trace.append(out)
         calls = parse_calls(out)
@@ -178,6 +182,8 @@ def main():
     ap.add_argument("--out", default="submission.jsonl")
     ap.add_argument("--llm", default=LLM_MODEL, help='HF model id, or "gold" (train only)')
     ap.add_argument("--asr", default=ASR_MODEL)
+    ap.add_argument("--asr-device", default="cuda:0")
+    ap.add_argument("--llm-device", default="cuda:0", help="judges run on 1x A30: keep both on cuda:0 for the final run")
     ap.add_argument("--text", action="store_true", help="use audio_text instead of ASR (train only)")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
@@ -202,9 +208,10 @@ def main():
     if a.limit:
         items = items[:a.limit]
 
-    llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm)
-    asr = None if a.text else ASR(a.asr)
+    llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm, a.llm_device)
+    asr = None if a.text else ASR(a.asr, a.asr_device)
 
+    slow = []
     with open(a.out, "w", encoding="utf-8") as fout, open(a.out + ".trace.jsonl", "w", encoding="utf-8") as ftr:
         for i, item in enumerate(items):
             t0 = time.time()
@@ -223,15 +230,35 @@ def main():
             if isinstance(llm, GoldLLM):
                 llm.reset(item)
             trace = []
-            try:
-                run_agent(env, llm, msgs, tools, catalog, t0 + BUDGET_S, trace)
-            except Exception as e:  # keep whatever was already executed; a crash would score 0 anyway
-                trace.append(f"ERROR {type(e).__name__}: {e}")
+            while True:
+                try:
+                    run_agent(env, llm, msgs, tools, catalog, trace)
+                    break
+                except Exception as e:  # keep whatever was already executed; a crash would score 0 anyway
+                    trace.append(f"ERROR {type(e).__name__}: {str(e)[:200]}")
+                    if "OutOfMemory" not in type(e).__name__:
+                        break
+                    import torch
+                    with torch.cuda.device(a.llm_device):  # empty_cache only frees the current device
+                        torch.cuda.empty_cache()
+                    # retry with half the history, only while nothing has run on the env yet
+                    if env.get_tool_calls() or not n_hist:
+                        break
+                    n_hist //= 2
+                    msgs = build_messages(item, texts, n_hist)
+                    trace.append(f"RETRY kept_history={n_hist}")
             calls = env.get_tool_calls()
+            dt = time.time() - t0
+            if dt > TIME_LIMIT_S:
+                slow.append((item["id"], round(dt, 1)))
             fout.write(json.dumps({"id": item["id"], "tool_calls": calls, "state_hash": env.get_state_hash()}, ensure_ascii=False) + "\n")
             ftr.write(json.dumps({"id": item["id"], "texts": texts, "kept_history": n_hist, "outputs": trace,
-                                  "seconds": round(time.time() - t0, 2)}, ensure_ascii=False) + "\n")
-            print(f"[{i + 1}/{len(items)}] {item['id']} calls={len(calls)} {time.time() - t0:.1f}s", flush=True)
+                                  "seconds": round(dt, 2)}, ensure_ascii=False) + "\n")
+            print(f"[{i + 1}/{len(items)}] {item['id']} calls={len(calls)} {dt:.1f}s", flush=True)
+
+    print(f"\n{len(items)} samples -> {a.out} | timeout (> {TIME_LIMIT_S}s): {len(slow)}")
+    for sid, dt in slow:
+        print(f"  {sid}: {dt}s")
 
 
 if __name__ == "__main__":
