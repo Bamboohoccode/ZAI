@@ -204,7 +204,6 @@ class ASR:
             model=self.model,
             tokenizer=self.processor.tokenizer,
             feature_extractor=self.processor.feature_extractor,
-            device=device,
             torch_dtype=torch_dtype,
         )
 
