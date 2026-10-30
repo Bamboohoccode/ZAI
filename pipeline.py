@@ -1,6 +1,6 @@
-"""LifeMate baseline: Qwen3-ASR-0.6B -> Qwen3-4B tool-calling agent -> zaic_tools -> submission.jsonl.
+"""LifeMate baseline: ChunkFormer-CTC-large-vie -> Qwen3-4B tool-calling agent -> zaic_tools -> submission.jsonl.
 
-pip install -U torch transformers accelerate qwen-asr
+pip install -U torch transformers accelerate chunkformer
 
 python pipeline.py --root DATA --split public_test                        # full pipeline, 1 GPU (judges: 1x A30)
 python pipeline.py --root DATA --split public_test --llm-device cuda:1    # Kaggle 2x T4: ASR on cuda:0, LLM on cuda:1
@@ -14,16 +14,9 @@ import re
 import sys
 import time
 from pathlib import Path
-import os
 import torch
-from peft import PeftModel
-from transformers import (
-    WhisperForConditionalGeneration,
-    WhisperProcessor,
-    pipeline,
-)
 
-ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
+ASR_MODEL = "khanhld/chunkformer-ctc-large-vie"  # 110M params, CTC
 LLM_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
 MAX_CTX = 16384
 MAX_NEW = 512
@@ -43,7 +36,7 @@ Quy tắc:
 - Thiếu tham số bắt buộc mà không suy ra được từ lời nói, ngữ cảnh, lịch sử hay tool đọc: gọi sys.ask_missing_info(tool_name, params) rồi dừng.
 - Không app nào đã cài làm được yêu cầu, hoặc người dùng chỉ trò chuyện: không gọi tool nào.
 - Thời gian dùng ISO 8601 có múi giờ, ví dụ 2026-11-11T05:30:00+07:00. Tiền là số nguyên VND.
-- Lời người dùng là bản nhận dạng giọng nói, có thể sai chính tả, hãy hiểu theo ý gần nhất.
+- Lời người dùng là bản nhận dạng giọng nói: viết thường, không dấu câu, số đọc bằng chữ ("năm mươi ngàn" = 50000, "chín giờ" = 09:00), có thể sai chính tả, hãy hiểu theo ý gần nhất.
 - Xong việc thì trả lời một câu ngắn, không gọi thêm tool."""
 
 
@@ -151,79 +144,16 @@ class GoldLLM:
         c = self.queue.pop(0)
         return f"<tool_call>\n{json.dumps(c, ensure_ascii=False)}\n</tool_call>"
 
-"""Hỗ trợ cả 2 cách gọi:
-
-    - ASR(adapter_path="./phowhisper-finetuned", device="cuda")
-    - ASR("./phowhisper-finetuned", device="cuda")
-"""
 class ASR:
-
-    def __init__(
-        self,
-        name="vinai/phowhisper-medium",
-        device="cuda",
-        adapter_path=None,
-    ):
-    # Xử lý linh hoạt nếu người dùng truyền thẳng thư mục adapter vào biến 'name'
-        if os.path.isdir(name) and adapter_path == "./phowhisper-finetuned":
-            adapter_path = name
-            name = "vinai/phowhisper-medium"
-
-        # Xác định kiểu dữ liệu (FP16 cho GPU để chạy nhanh và nhẹ VRAM)
-        torch_dtype = (
-            torch.float16
-            if "cuda" in str(device) and torch.cuda.is_available()
-            else torch.float32
-        )
-
-        print(f"Loading Base Model: {name} ...")
-        base_model = WhisperForConditionalGeneration.from_pretrained(
-            name, torch_dtype=torch_dtype, device_map=device
-        )
-
-        # Nạp LoRA Adapter nếu có
-        if adapter_path and os.path.exists(adapter_path):
-            print(f"Loading LoRA Adapter from: {adapter_path} ...")
-            model = PeftModel.from_pretrained(base_model, adapter_path)
-            # Gộp vĩnh viễn LoRA vào base model để đạt tốc độ suy luận nhanh nhất
-            self.model = model.merge_and_unload()
-        else:
-            self.model = base_model
-
-        # Nạp Processor (Tokenizer + Feature Extractor)
-        try:
-            self.processor = WhisperProcessor.from_pretrained(
-                adapter_path if adapter_path else name
-            )
-        except Exception:
-            self.processor = WhisperProcessor.from_pretrained(name)
-
-        # Đóng gói pipeline
-        self.pipe = pipeline(
-            task="automatic-speech-recognition",
-            model=self.model,
-            tokenizer=self.processor.tokenizer,
-            feature_extractor=self.processor.feature_extractor,
-            torch_dtype=torch_dtype,
-        )
+    def __init__(self, name, device):
+        from chunkformer import ChunkFormerModel
+        self.model = ChunkFormerModel.from_pretrained(name).to(device).eval()
 
     def __call__(self, paths):
-        audio_paths = [str(p) for p in paths]
-        if not audio_paths:
-            return []
-
-        # Pipeline của Hugging Face hỗ trợ truyền trực tiếp list paths và batch_size
-        results = self.pipe(
-            audio_paths,
-            batch_size=len(audio_paths),
-            generate_kwargs={"language": "vi", "task": "transcribe"},
-        )
-
-        # Đảm bảo kết quả luôn trả về dạng list text giống class cũ
-        if isinstance(results, dict):
-            results = [results]
-
-        return [r["text"].strip() for r in results]
+        with torch.no_grad():  # CTC greedy decoding: deterministic
+            return [t.strip() for t in self.model.batch_decode(audio_paths=[str(p) for p in paths], chunk_size=64,
+                                                              left_context_size=128, right_context_size=128,
+                                                              total_batch_duration=1800)]
 
 
 def run_agent(env, llm, msgs, tools, catalog, trace):
@@ -261,7 +191,6 @@ def main():
     ap.add_argument("--out", default="submission.jsonl")
     ap.add_argument("--llm", default=LLM_MODEL, help='HF model id, or "gold" (train only)')
     ap.add_argument("--asr", default=ASR_MODEL)
-    ap.add_argument("--asr_finetuned_path",type = str)
     ap.add_argument("--asr-device", default="cuda:0")
     ap.add_argument("--llm-device", default="cuda:0", help="judges run on 1x A30: keep both on cuda:0 for the final run")
     ap.add_argument("--text", action="store_true", help="use audio_text instead of ASR (train only)")
@@ -292,7 +221,7 @@ def main():
     # Without GPU if a.llm = gold
     llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm, a.llm_device)
     # You when we train only LLM :v 
-    asr = None if a.text else ASR(a.asr, a.asr_device,a.asr_finetuned_path)
+    asr = None if a.text else ASR(a.asr, a.asr_device)
 
     slow = []
     with open(a.out, "w", encoding="utf-8") as fout, open(a.out + ".trace.jsonl", "w", encoding="utf-8") as ftr:
