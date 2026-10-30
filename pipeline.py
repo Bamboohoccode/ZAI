@@ -5,6 +5,8 @@ pip install -U torch transformers accelerate chunkformer
 python pipeline.py --root DATA --split public_test                        # full pipeline, 1 GPU (judges: 1x A30)
 python pipeline.py --root DATA --split public_test --llm-device cuda:1    # Kaggle 2x T4: ASR on cuda:0, LLM on cuda:1
 python pipeline.py --root DATA --split train --text --limit 100           # skip ASR, use audio_text
+python pipeline.py --root DATA --split public_test --asr ./asr_ft --llm ./llm_ft    # fine-tuned full models (local folders)
+python pipeline.py --root DATA --split public_test --llm-lora ./qwen_lora            # LoRA adapter on top of --llm
 python pipeline.py --root DATA --split train --text --llm gold --limit 50  # replay gold, no GPU (self-check)
 """
 import argparse
@@ -105,7 +107,7 @@ def parse_calls(text):
 
 
 class HFLLM:
-    def __init__(self, name, device):
+    def __init__(self, name, device, lora=None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.tok = AutoTokenizer.from_pretrained(name)
@@ -114,7 +116,11 @@ class HFLLM:
             # Expanding KV heads instead lets SDPA use the memory-efficient kernel.
             import transformers.integrations.sdpa_attention as sdpa
             sdpa.use_gqa_in_sdpa = lambda *args, **kwargs: False
-        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=gpu_dtype(device), attn_implementation="sdpa", device_map=device).eval()
+        self.model = AutoModelForCausalLM.from_pretrained(name, dtype=gpu_dtype(device), attn_implementation="sdpa", device_map=device)
+        if lora:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, lora).merge_and_unload()  # merged: no adapter overhead per token
+        self.model.eval()
 
     def n_tokens(self, msgs, tools):
         return len(self.tok.apply_chat_template(msgs, tools=tools, add_generation_prompt=True, tokenize=True))
@@ -189,8 +195,9 @@ def main():
     ap.add_argument("--root", required=True, help="folder holding the split folders")
     ap.add_argument("--split", default="public_test")
     ap.add_argument("--out", default="submission.jsonl")
-    ap.add_argument("--llm", default=LLM_MODEL, help='HF model id, or "gold" (train only)')
-    ap.add_argument("--asr", default=ASR_MODEL)
+    ap.add_argument("--llm", default=LLM_MODEL, help='HF model id or local fine-tuned folder, or "gold" (train only)')
+    ap.add_argument("--llm-lora", help="LoRA adapter folder, merged into --llm at load time")
+    ap.add_argument("--asr", default=ASR_MODEL, help="HF model id or local fine-tuned ChunkFormer folder (config.yaml + pytorch_model.bin)")
     ap.add_argument("--asr-device", default="cuda:0")
     ap.add_argument("--llm-device", default="cuda:0", help="judges run on 1x A30: keep both on cuda:0 for the final run")
     ap.add_argument("--text", action="store_true", help="use audio_text instead of ASR (train only)")
@@ -219,7 +226,7 @@ def main():
         items = items[:a.limit]
 
     # Without GPU if a.llm = gold
-    llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm, a.llm_device)
+    llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm, a.llm_device, a.llm_lora)
     # You when we train only LLM :v 
     asr = None if a.text else ASR(a.asr, a.asr_device)
 
