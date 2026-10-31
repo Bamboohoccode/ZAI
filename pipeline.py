@@ -6,6 +6,7 @@ python pipeline.py --root DATA --split public_test                        # full
 python pipeline.py --root DATA --split public_test --llm-device cuda:1    # Kaggle 2x T4: ASR on cuda:0, LLM on cuda:1
 python pipeline.py --root DATA --split train --text --limit 100           # skip ASR, use audio_text
 python pipeline.py --root DATA --split public_test --asr ./asr_ft --llm ./llm_ft    # fine-tuned full models (local folders)
+python pipeline.py --root DATA --split public_test --asr-ckpt ./chunkformer_ft/final.pt          # fine-tuned ChunkFormer weights
 python pipeline.py --root DATA --split public_test --llm-lora ./qwen_lora            # LoRA adapter on top of --llm
 python pipeline.py --root DATA --split train --text --llm gold --limit 50  # replay gold, no GPU (self-check)
 """
@@ -151,9 +152,15 @@ class GoldLLM:
         return f"<tool_call>\n{json.dumps(c, ensure_ascii=False)}\n</tool_call>"
 
 class ASR:
-    def __init__(self, name, device):
+    def __init__(self, name, device, ckpt=None):
         from chunkformer import ChunkFormerModel
-        self.model = ChunkFormerModel.from_pretrained(name).to(device).eval()
+        self.model = ChunkFormerModel.from_pretrained(name)  # architecture, vocab and CMVN come from `name`
+        if ckpt:  # fine-tuned weights (.pt from ChunkFormer training) on top of `name`
+            sd = torch.load(ckpt, map_location="cpu")
+            sd = sd.get("model", sd.get("state_dict", sd))
+            # strict: chunkformer's own load_checkpoint uses strict=False and silently keeps base weights on key mismatch
+            self.model.model.load_state_dict({k.removeprefix("module."): v for k, v in sd.items()}, strict=True)
+        self.model = self.model.to(device).eval()
 
     def __call__(self, paths):
         with torch.no_grad():  # CTC greedy decoding: deterministic
@@ -197,7 +204,8 @@ def main():
     ap.add_argument("--out", default="submission.jsonl")
     ap.add_argument("--llm", default=LLM_MODEL, help='HF model id or local fine-tuned folder, or "gold" (train only)')
     ap.add_argument("--llm-lora", help="LoRA adapter folder, merged into --llm at load time")
-    ap.add_argument("--asr", default=ASR_MODEL, help="HF model id or local fine-tuned ChunkFormer folder (config.yaml + pytorch_model.bin)")
+    ap.add_argument("--asr", default=ASR_MODEL, help="ChunkFormer: HF id or local folder (config.yaml + pytorch_model.bin + vocab.txt + global_cmvn)")
+    ap.add_argument("--asr-ckpt", help="fine-tuned ChunkFormer checkpoint (.pt) loaded onto --asr")
     ap.add_argument("--asr-device", default="cuda:0")
     ap.add_argument("--llm-device", default="cuda:0", help="judges run on 1x A30: keep both on cuda:0 for the final run")
     ap.add_argument("--text", action="store_true", help="use audio_text instead of ASR (train only)")
@@ -228,7 +236,7 @@ def main():
     # Without GPU if a.llm = gold
     llm = GoldLLM() if a.llm == "gold" else HFLLM(a.llm, a.llm_device, a.llm_lora)
     # You when we train only LLM :v 
-    asr = None if a.text else ASR(a.asr, a.asr_device)
+    asr = None if a.text else ASR(a.asr, a.asr_device, a.asr_ckpt)
 
     slow = []
     with open(a.out, "w", encoding="utf-8") as fout, open(a.out + ".trace.jsonl", "w", encoding="utf-8") as ftr:
